@@ -1,0 +1,10 @@
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+monitor:
+  external-api:
+    url: https://jsonplaceholder.typicode.com/posts/1
+    fixed-delay: 30000

@@ -1,0 +1,18 @@
+groups:
+  - name: external-api-alerts
+    interval: 10s
+    rules:
+      - alert: ExternalApiFailureDetected
+        expr: |
+          increase(
+            external_api_requests_total{
+              job="external-api-monitor",
+              outcome="failure"
+            }[5m]
+          ) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: External API check failure detected
+          description: At least one external API check failed during the last 5 minutes.

@@ -4,7 +4,7 @@ A lightweight monitoring project built with **Spring Boot, Micrometer, Prometheu
 
 The application periodically sends HTTP requests to an external API, records request outcomes and latency as custom metrics, exposes them through Spring Boot Actuator, and lets Prometheus collect them for visualization in Grafana.
 
-The project was built as a practical exercise to understand the complete monitoring flow from **application metrics to dashboards**.
+The project was built as a practical exercise to understand the complete monitoring flow from **application metrics to dashboards and alert rules**.
 
 ---
 
@@ -19,6 +19,7 @@ flowchart LR
     E --> F[(Prometheus TSDB)]
     G[Grafana] -->|PromQL Queries| E
     G --> H[Monitoring Dashboard]
+    E --> I[Prometheus Alert Rules]
 ```
 
 There are two independent HTTP flows in the project:
@@ -28,8 +29,11 @@ Spring Boot  ---> External API
 Prometheus   ---> Spring Boot /actuator/prometheus
 ```
 
-Prometheus does **not** monitor the external API directly.  
+Prometheus does **not** monitor the external API directly.
+
 The Spring Boot application performs the external check and publishes the resulting metrics.
+
+Prometheus then collects those metrics, stores them as time-series data, evaluates alert rules, and makes the data available to Grafana.
 
 ---
 
@@ -46,6 +50,20 @@ The Spring Boot application performs the external check and publishes the result
 - Grafana
 - Docker Compose
 - Maven
+
+---
+
+## Features
+
+- Periodic external API health checks
+- HTTP status monitoring
+- Success / failure request counters
+- Request latency measurement
+- Prometheus-compatible metrics endpoint
+- Prometheus scraping and time-series storage
+- Automatic JVM and process metrics
+- Grafana monitoring dashboard
+- Prometheus alert rule for recent external API failures
 
 ---
 
@@ -175,11 +193,13 @@ Because Spring Boot runs on the host machine while Prometheus runs inside Docker
 host.docker.internal:8080
 ```
 
+Prometheus stores the collected values as time-series data in its TSDB.
+
 ---
 
 ## Useful PromQL Queries
 
-### Spring Boot scrape status
+### Spring Boot Scrape Status
 
 ```promql
 up{job="external-api-monitor"}
@@ -194,7 +214,7 @@ up{job="external-api-monitor"}
 
 ---
 
-### External API requests
+### External API Requests
 
 ```promql
 external_api_requests_total
@@ -213,7 +233,7 @@ sum(
 
 ---
 
-### Checks during the last 5 minutes
+### Checks During the Last 5 Minutes
 
 ```promql
 sum by (outcome) (
@@ -225,9 +245,11 @@ sum by (outcome) (
 )
 ```
 
+`increase()` is used because the application performs a low-frequency scheduled request and the dashboard is interested in how many checks occurred during a recent time window.
+
 ---
 
-### Average external API latency
+### Average External API Latency
 
 ```promql
 1000 * (
@@ -245,7 +267,9 @@ sum by (outcome) (
 )
 ```
 
-The result is converted from seconds to milliseconds.
+The Timer stores duration values in seconds.
+
+The query divides the total duration increase by the number of measured requests and multiplies the result by `1000` to display average latency in milliseconds.
 
 ---
 
@@ -257,7 +281,7 @@ The project includes a Grafana dashboard named:
 External API Monitoring
 ```
 
-It contains four panels:
+It contains four panels.
 
 ### Spring Boot Target Status
 
@@ -312,6 +336,88 @@ grafana/external-api-monitoring.json
 
 The dashboard JSON is version-controlled in the repository and does not contain metric data itself.
 
+Grafana reads the actual metric data from Prometheus.
+
+---
+
+## Alerting
+
+Prometheus also evaluates a simple alert rule for recent external API failures.
+
+The rule is stored in:
+
+```text
+prometheus/alerts.yml
+```
+
+The alert is named:
+
+```text
+ExternalApiFailureDetected
+```
+
+Its condition is:
+
+```promql
+increase(
+  external_api_requests_total{
+    job="external-api-monitor",
+    outcome="failure"
+  }[5m]
+) > 0
+```
+
+This checks whether the failure Counter has increased during the previous five minutes.
+
+Using:
+
+```promql
+external_api_requests_total{outcome="failure"} > 0
+```
+
+would not be appropriate because a Counter only increases. A single old failure could therefore keep the condition true indefinitely.
+
+Using `increase(...[5m])` makes the rule react only to **recent failures**.
+
+The alert is configured with:
+
+```yaml
+for: 30s
+```
+
+This introduces three possible alert states:
+
+- **Inactive** — the PromQL condition is false.
+- **Pending** — the condition is true, but it has not remained true for 30 seconds yet.
+- **Firing** — the condition has remained true for at least 30 seconds.
+
+The alert rule also contains:
+
+```yaml
+severity: warning
+```
+
+This is a label that classifies the alert severity.
+
+The rule contains human-readable annotations such as:
+
+```text
+summary: External API check failure detected
+description: At least one external API check failed during the last 5 minutes.
+```
+
+Prometheus currently **detects and exposes the alert state only**.
+
+No notification delivery system is configured.
+
+An Alertmanager could later receive firing alerts and route them to systems such as:
+
+- Email
+- Slack
+- Webhooks
+
+Alertmanager is intentionally outside the scope of this project.
+
 ---
 
 ## Project Structure
@@ -322,6 +428,7 @@ The dashboard JSON is version-controlled in the repository and does not contain 
 ├── grafana
 │   └── external-api-monitoring.json
 ├── prometheus
+│   ├── alerts.yml
 │   └── prometheus.yml
 ├── src
 │   ├── main
@@ -453,6 +560,18 @@ You can also query:
 external_api_requests_total
 ```
 
+Prometheus rules can be inspected at:
+
+```text
+http://localhost:9090/rules
+```
+
+Alerts can be inspected at:
+
+```text
+http://localhost:9090/alerts
+```
+
 ---
 
 ## 6. Open Grafana
@@ -476,7 +595,13 @@ The Prometheus data source should use:
 http://prometheus:9090
 ```
 
-instead of `localhost:9090`, because Grafana and Prometheus run in separate containers on the same Docker Compose network.
+instead of:
+
+```text
+localhost:9090
+```
+
+because Grafana and Prometheus run in separate containers on the same Docker Compose network.
 
 ---
 
@@ -498,12 +623,12 @@ docker compose down
 
 ## Monitoring Flow
 
-The complete data flow is:
+The complete monitoring flow is:
 
 ```text
 External API
      ↑
-     │ HTTP GET
+     │ Scheduled HTTP GET
      │
 Spring Boot
      │
@@ -516,26 +641,30 @@ Spring Boot
           ▼
  /actuator/prometheus
           ↑
-          │ scrape
+          │ Scrape
           │
       Prometheus
-          │
-          │ PromQL
-          ▼
-        Grafana
-          │
-          ▼
-       Dashboard
+       /       \
+      /         \
+   TSDB       Alert Rules
+     │
+     │ PromQL
+     ▼
+   Grafana
+     │
+     ▼
+  Dashboard
 ```
 
-This project demonstrates the distinction between:
+The project demonstrates the distinction between:
 
 - producing application metrics,
 - exposing metrics,
 - scraping metrics,
 - storing time-series data,
 - querying metrics with PromQL,
-- and visualizing them through Grafana.
+- visualizing metrics through Grafana,
+- and evaluating alert conditions with Prometheus.
 
 ---
 
@@ -545,7 +674,7 @@ The project intentionally keeps the architecture small and focused on monitoring
 
 It does not currently include:
 
-- Alertmanager / notifications
+- Alertmanager and notification delivery
 - Distributed tracing
 - Loki / centralized logging
 - Kubernetes
